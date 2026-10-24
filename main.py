@@ -1,62 +1,50 @@
-"""FastAPI entrypoint."""
-from __future__ import annotations
+import os
 
-import httpx
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from sqlalchemy import select
+from fastapi import FastAPI, Header, HTTPException, Request
 
-from . import __version__
-from .audit import AuditLog
-from .config import Settings, get_settings
-from .context import Ctx
-from .db import User, init_db, make_engine, make_session_factory
-from .detection import Detector
-from .llm_client import LLMClient
-from .routes import auth, blue, red
-from .security import hash_password
+from . import mock_model, openai_backend
+from .auth import Verifier
+
+MAX_BODY = 16 * 1024
 
 
-def create_app(settings: Settings | None = None, llm_http: httpx.Client | None = None) -> FastAPI:
-    s = settings or get_settings()
-    engine = make_engine(s.database_url)
-    init_db(engine)
-    sf = make_session_factory(engine)
-    audit = AuditLog(sf, s.audit_key, engine.dialect.name)
-    ctx = Ctx(s, sf, audit, Detector(audit, s), LLMClient(s.llm_url, s.service_secret, llm_http))
+def create_app(env: dict | None = None) -> FastAPI:
+    e = env or os.environ
+    secret = e.get("SERVICE_SECRET", "")
+    canary = e.get("CANARY_SECRET", "")
+    if len(secret) < 16 or len(canary) < 8:
+        raise RuntimeError("SERVICE_SECRET and CANARY_SECRET are required")
+    backend = e.get("LLM_BACKEND", "mock")
+    verifier = Verifier(secret)
+    app = FastAPI(title="Bayora LLM Sandbox", docs_url=None, redoc_url=None, openapi_url=None)
 
-    with sf() as sess, sess.begin():
-        for name, (role, pw) in s.seed_passwords.items():
-            if not sess.execute(select(User).where(User.username == name)).scalar_one_or_none():
-                sess.add(User(username=name, role=role, password_hash=hash_password(pw)))
-    audit.append(actor="system", role="system", event_type="system.started", severity="info",
-                 details={"version": __version__, "env": s.env})
-
-    app = FastAPI(title="Bayora Secure Gateway", version=__version__,
-                  docs_url=None if s.env == "production" else "/docs",
-                  redoc_url=None, openapi_url=None if s.env == "production" else "/openapi.json")
-    app.state.ctx = ctx
-    if s.cors_origins:
-        app.add_middleware(CORSMiddleware, allow_origins=list(s.cors_origins), allow_methods=["GET", "POST", "DELETE"],
-                           allow_headers=["Authorization", "Content-Type"])
-
-    @app.middleware("http")
-    async def security_headers(request: Request, call_next):
-        resp = await call_next(request)
-        resp.headers.update({"X-Content-Type-Options": "nosniff", "Cache-Control": "no-store",
-                             "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY"})
-        return resp
-
-    @app.exception_handler(Exception)
-    async def unhandled(_: Request, exc: Exception):
-        return JSONResponse({"detail": "Internal error"}, status_code=500)
-
-    @app.get("/health", tags=["meta"])
+    @app.get("/health")
     def health():
-        return {"status": "ok", "version": __version__}
+        return {"status": "ok", "backend": backend}
 
-    app.include_router(auth.router)
-    app.include_router(red.router)
-    app.include_router(blue.router)
+    @app.post("/v1/complete")
+    async def complete(request: Request, x_bayora_request_id: str = Header(""),
+                       x_bayora_timestamp: str = Header(""), x_bayora_signature: str = Header("")):
+        body = await request.body()
+        if len(body) > MAX_BODY:
+            raise HTTPException(413, "too large")
+        reason = verifier.check(x_bayora_request_id, x_bayora_timestamp, x_bayora_signature, body)
+        if reason:
+            raise HTTPException(403, "forbidden")
+        try:
+            prompt = str(__import__("json").loads(body)["prompt"])
+        except Exception:
+            raise HTTPException(400, "bad request")
+        if backend == "openai":
+            text = openai_backend.complete(prompt, mock_model.system_prompt(canary),
+                                           e["OPENAI_API_KEY"], e.get("OPENAI_MODEL", "gpt-4o-mini"))
+        else:
+            text = mock_model.respond(prompt, canary)
+        return {"text": text, "backend": backend}
+
     return app
+
+
+app = None
+if os.environ.get("SERVICE_SECRET"):
+    app = create_app()
