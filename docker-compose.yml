@@ -1,0 +1,100 @@
+# Bayora: zone-isolated red / blue / LLM / data networks. Only the gateway joins them all.
+name: bayora
+
+x-hardened: &hardened
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  tmpfs: ["/tmp"]
+  restart: unless-stopped
+  pids_limit: 128
+
+networks:
+  edge:     {}                  # the only network with a published port (loopback only)
+  red_net:  { internal: true }  # red-runner <-> gateway. No internet, no LLM, no DB.
+  blue_net: { internal: true }  # blue-agent <-> gateway.
+  llm_net:  { internal: true }  # gateway <-> llm-sandbox. The model has NO internet access.
+  data_net: { internal: true }  # gateway <-> postgres.
+
+volumes:
+  db_data: {}
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: bayora
+      POSTGRES_USER: bayora_admin
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run scripts/gen_env.sh}
+      BAYORA_APP_PASSWORD: ${BAYORA_APP_PASSWORD:?run scripts/gen_env.sh}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    networks: [data_net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bayora_admin -d bayora"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  llm-sandbox:
+    <<: *hardened
+    build: ./llm-sandbox
+    environment:
+      SERVICE_SECRET: ${SERVICE_SECRET:?run scripts/gen_env.sh}
+      CANARY_SECRET: ${CANARY_SECRET:?run scripts/gen_env.sh}
+      LLM_BACKEND: ${LLM_BACKEND:-mock}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+    networks: [llm_net]
+    mem_limit: 512m
+    cpus: 1.0
+
+  gateway:
+    <<: *hardened
+    build: ./gateway
+    depends_on:
+      db: { condition: service_healthy }
+      llm-sandbox: { condition: service_healthy }
+    environment:
+      BAYORA_ENV: ${BAYORA_ENV:-production}
+      DATABASE_URL: postgresql+psycopg://bayora_app:${BAYORA_APP_PASSWORD}@db:5432/bayora
+      JWT_SECRET: ${JWT_SECRET:?run scripts/gen_env.sh}
+      SERVICE_SECRET: ${SERVICE_SECRET}
+      AUDIT_HMAC_KEY: ${AUDIT_HMAC_KEY:?run scripts/gen_env.sh}
+      CANARY_SECRET: ${CANARY_SECRET}
+      LLM_URL: http://llm-sandbox:9000
+      RED_PASSWORD: ${RED_PASSWORD:?run scripts/gen_env.sh}
+      BLUE_PASSWORD: ${BLUE_PASSWORD:?run scripts/gen_env.sh}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?run scripts/gen_env.sh}
+    networks: [edge, red_net, blue_net, llm_net, data_net]
+    ports: ["127.0.0.1:8000:8000"]
+    mem_limit: 512m
+
+  dashboard:
+    <<: *hardened
+    build: ./dashboard
+    depends_on:
+      gateway: { condition: service_healthy }
+    networks: [edge]
+    ports: ["127.0.0.1:8080:8080"]
+    mem_limit: 128m
+
+  # --- team tooling: docker compose --profile tools run --rm red-runner --mode enforce -------------
+  red-runner:
+    <<: *hardened
+    profiles: [tools]
+    build: ./red-runner
+    environment: { GATEWAY_URL: "http://gateway:8000", RED_PASSWORD: "${RED_PASSWORD}" }
+    networks: [red_net]
+
+  blue-agent:
+    <<: *hardened
+    profiles: [monitor]
+    build: ./blue-agent
+    environment:
+      GATEWAY_URL: http://gateway:8000
+      BLUE_PASSWORD: ${BLUE_PASSWORD}
+      SIEM_WEBHOOK_URL: ${SIEM_WEBHOOK_URL:-}
+    networks: [blue_net]

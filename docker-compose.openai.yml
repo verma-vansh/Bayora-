@@ -1,0 +1,11 @@
+# Optional: use a real OpenAI model instead of the built-in mock.
+#   docker compose -f docker-compose.yml -f docker-compose.openai.yml up --build
+# TRADE-OFF: the sandbox now needs outbound access to api.openai.com. Put it behind an egress
+# proxy that allow-lists only that host before using this on anything beyond a lab.
+networks:
+  egress: {}
+services:
+  llm-sandbox:
+    environment:
+      LLM_BACKEND: openai
+    networks: [llm_net, egress]
